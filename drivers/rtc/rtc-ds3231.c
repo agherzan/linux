@@ -10,6 +10,8 @@
 
 #include <linux/bcd.h>
 #include <linux/err.h>
+#include <linux/hwmon.h>
+#include <linux/hwmon-sysfs.h>
 #include <linux/i2c.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -35,12 +37,19 @@
 #define DS3231_REG_CENTURY	DS3231_REG_MONTH
 #define DS3231_MASK_CENTURY	0X80
 
+/* Temperature sensor */
+#define DS3231_REG_TEMP		0x11
+#define DS3231_TEMP_RESOLUTION	25
+
 /**
  * struct ds3231 - private data for the ds3231 device
  * @rtc: Associated RTC device structure
+ * @hwmon: Associated temperature sensor device
  */
 struct ds3231 {
 	struct rtc_device *rtc;
+	struct device *hwmon;
+	struct device *dev;
 };
 
 static const struct i2c_device_id ds3231_id[] = {
@@ -233,31 +242,89 @@ static const struct rtc_class_ops ds3231_rtc_ops = {
 };
 
 /**
+ * ds3231_temp_show - Read the temperature sensor
+ * @device: The associated device node
+ * @attr: Device attribute
+ * @buf: Temperature in millidegrees Celsius
+ */
+static ssize_t ds3231_temp_show(struct device *device,
+				struct device_attribute *attr, char *buf)
+{
+	uint8_t temp_buf[2];
+	int temp, ret;
+	struct ds3231 *ds3231 = dev_get_drvdata(device);
+	struct i2c_client *client = container_of(ds3231->dev, struct i2c_client, dev);
+
+	ret = ds3231_read_regs(client, DS3231_REG_TEMP, temp_buf,
+			sizeof(temp_buf));
+	if (ret)
+		return ret;
+
+	/* The device represents the temperature as 10 bit code with a 0.25C
+	 * resolution. The first 8 bits are from register 11h and represent the
+	 * integer portion while the last 2 bits are from the upper nibble at
+	 * location 12h and represent the factional portion.
+	 */
+	dev_dbg(&client->dev, "%s: raw temp registers 0x%02x=%02x, 0x%02x=x%02x", __func__, DS3231_REG_TEMP, temp_buf[0], DS3231_REG_TEMP+1, temp_buf[1]);
+	temp = (((temp_buf[0] << 8) | temp_buf[1]) >> 6);
+	temp *= DS3231_TEMP_RESOLUTION * 10;
+	dev_dbg(&client->dev, "%s: temp: %dmC", __func__, temp);
+
+	return sprintf(buf, "%d\n", temp);
+}
+
+/* Define the attribute group for registering the hwmon device - temp sensor */
+SENSOR_DEVICE_ATTR(temp1, 0444, ds3231_temp_show, NULL, 0);
+static struct attribute *ds3231_hwmon_attrs[] = {
+	&sensor_dev_attr_temp1.dev_attr.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(ds3231_hwmon);
+
+/**
  * ds3231_probe() - Probe function for the ds3231 driver
  */
 static int ds3231_probe(struct i2c_client *client, const struct i2c_device_id *id)
 {
 	int ret;
 	struct ds3231 *priv;
+	struct device *dev;
 
 	/* Allocate a private struct for the device */
 	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
 	if (!priv) {
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto fail;
 	}
+
+	priv->dev = &client->dev;
 
 	/* Register a rtc device */
 	priv->rtc = rtc_device_register("ds3231", &client->dev, &ds3231_rtc_ops,
 					THIS_MODULE);
 	if (IS_ERR(priv->rtc)) {
 		ret = PTR_ERR(priv->rtc);
-		return ret;
+		goto fail_rtc;
+	}
+
+	/* Register a hwmon device for the temperature sensor */
+	priv->hwmon = hwmon_device_register_with_groups(&client->dev, "ds3231", priv,
+						ds3231_hwmon_groups);
+	if (IS_ERR(priv->hwmon)) {
+		ret = PTR_ERR(priv->hwmon);
+		goto fail_hwmon;
 	}
 
 	/* Set client private data */
 	i2c_set_clientdata(client, priv);
 
 	return 0;
+
+fail_hwmon:
+	rtc_device_unregister(priv->rtc);
+fail_rtc:
+fail:
+	return ret;
 }
 
 /**
@@ -266,7 +333,7 @@ static int ds3231_probe(struct i2c_client *client, const struct i2c_device_id *i
 static int ds3231_remove(struct i2c_client *client) {
 	struct ds3231 *priv = i2c_get_clientdata(client);
 
-	/* Unregister rtc device and free client private data */
+	hwmon_device_unregister(priv->hwmon);
 	rtc_device_unregister(priv->rtc);
 	kfree(priv);
 
