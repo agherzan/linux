@@ -37,9 +37,41 @@
 #define DS3231_REG_CENTURY	DS3231_REG_MONTH
 #define DS3231_MASK_CENTURY	0X80
 
+/* Alarm 1 registers */
+#define DS3231_A1_SEC_REG	0x07 /* seconds register */
+#define DS3231_A1_SEC_MASK	0x7f /* seconds mask */
+#define DS3231_A1_MIN_REG	0x08 /* minutes register */
+#define DS3231_A1_MIN_MASK	0x7f /* minutes mask */
+#define DS3231_A1_HOUR_REG	0x09 /* hour register */
+#define DS3231_A1_HOUR_MASK	0x3f /* hour mask */
+#define DS3231_A1_DATE_REG	0x0a /* date register */
+#define DS3231_A1_DATE_MASK	0x3f /* date mask */
+#define DS3231_A1_BASE_REG	DS3231_A1_SEC_REG
+#define DS3231_A1_SIZE		DS3231_A1_DATE_REG - DS3231_A1_BASE_REG + 1
+
+/* Alarm 1 register mask bits */
+#define DS3231_A1M1_REG		DS3231_A1_REG_SEC
+#define DS3231_A1M1_MASK	0x80
+#define DS3231_A1M2_REG		DS3231_A1_REG_MIN
+#define DS3231_A1M2_MASK	0x80
+#define DS3231_A1M3_REG		DS3231_A1_REG_HOUR
+#define DS3231_A1M3_MASK	0x80
+#define DS3231_A1M4_REG		DS3231_A1_REG_DAY
+#define DS3231_A1M4_MASK	0x80
+
+/* Alarm 1 day/date register */
+#define DS3231_DYDT_REG		DS3231_A1_REG_DAY
+#define DS3231_DYDT_MASK	0x40
+
 /* Temperature sensor */
 #define DS3231_REG_TEMP		0x11
 #define DS3231_TEMP_RESOLUTION	25
+
+/* Control/status registers */
+#define DS3231_CTL_REG		0x0e
+#define DS3231_CTL_A1IE_MASK	0x01
+#define DS3231_STATUS_REG	0x0f
+#define DS3231_STATUS_A1F_MASK	0x01
 
 /**
  * struct ds3231 - private data for the ds3231 device
@@ -233,12 +265,150 @@ static int ds3231_rtc_set_time(struct device *device, struct rtc_time *time) {
 	return 0;
 }
 
+
+/**
+ * ds3231_rtc_read_a1_cs - Read alarm 1, control and status registers from RTC
+ * 			 - device
+ * device @device: The associated device node
+ * @a1_buf: Array buffer for alarm 1 registers
+ * @cs_buf: Array buffer for control and status registers
+ */
+static int ds3231_read_a1_cs(struct device *device,
+			     uint8_t a1_buf[], uint8_t cs_buf[]) {
+	int ret;
+	struct i2c_client *client = container_of(device, struct i2c_client, dev);
+
+	/* Read all alarm 1 registers */
+	ret = ds3231_read_regs(client, DS3231_A1_BASE_REG, a1_buf,
+			       DS3231_A1_SIZE);
+	if (ret) {
+		dev_err(device, "%s: failed to read alarm 1 registers [%d]\n",
+			__func__, ret);
+		return ret;
+	}
+	dev_dbg(device, "%s: alarm 1 registers: sec=%02x, min=%02x, hour=%02x, date=%02x",
+		__func__, a1_buf[0], a1_buf[1], a1_buf[2], a1_buf[3]);
+
+	/* Read control and status registers - array of two registers */
+	ret = ds3231_read_regs(client, DS3231_CTL_REG, cs_buf, 2);
+	if (ret) {
+		dev_err(device, "%s: failed to read control/status registers [%d]\n",
+			__func__, ret);
+		return ret;
+	}
+	dev_dbg(device, "%s: control/status registers: control=%02x, status=%02x",
+		__func__, cs_buf[0], cs_buf[1]);
+
+	return 0;
+}
+
+/**
+ * ds3231_rtc_read_alarm - Read alarm from RTC device
+ * @device: The associated device node
+ * @alarm: Returned rtc_wkalrm structure
+ */
+static int ds3231_rtc_read_alarm(struct device *device, struct rtc_wkalrm *alarm) {
+	int ret;
+	uint8_t a1_buf[DS3231_A1_SIZE]; /* alarm 1 registers */
+	uint8_t cs_buf[2];	/* control and status registers */
+
+	/* Read alarm 1, control and status registers */
+	ret = ds3231_read_a1_cs(device, a1_buf, cs_buf);
+	if (ret)
+		return ret;
+
+	/* Construct alarm structure assuming:
+	 *	- hour in 24 format
+	 * 	- day/date register set to day of the month
+	 */
+	alarm->time.tm_sec = bcd2bin(a1_buf[0] & DS3231_A1_SEC_MASK);
+	alarm->time.tm_min = bcd2bin(a1_buf[1] & DS3231_A1_MIN_MASK);
+	alarm->time.tm_hour = bcd2bin(a1_buf[2] & DS3231_A1_HOUR_MASK);
+	alarm->time.tm_mday = bcd2bin(a1_buf[3] & DS3231_A1_DATE_MASK);
+	alarm->enabled = bcd2bin(cs_buf[0] & DS3231_CTL_A1IE_MASK);
+	alarm->pending = bcd2bin(cs_buf[1] & DS3231_STATUS_A1F_MASK);
+	dev_dbg(device, "%s: read alarm 1: sec=%d, min=%d, hour=%d, date=%d, enabled=%d, pending=%d",
+		__func__, alarm->time.tm_sec, alarm->time.tm_min,
+		alarm->time.tm_hour, alarm->time.tm_mday, alarm->enabled,
+		alarm->pending);
+
+	return 0;
+}
+
+/**
+ * ds3231_rtc_set_alarm - Set alarm for RTC device
+ * @device: The associated device node
+ * @alarm: Alarm to set
+ */
+static int ds3231_rtc_set_alarm(struct device *device, struct rtc_wkalrm *alarm) {
+	int ret;
+	/* We use the same array for reading and writing the registers. When
+	 * writing, we need the first value to be the destination address,
+	 * that's why we allocate an additional element. */
+	uint8_t a1_buf[DS3231_A1_SIZE + 1]; /* alarm 1 registers */
+	uint8_t cs_buf[2 + 1];	/* control and status registers */
+	struct i2c_client *client = container_of(device, struct i2c_client, dev);
+
+	dev_dbg(device, "%s: set alarm 1: sec=%d, min=%d, hour=%d, date=%d, enabled=%d, pending=%d",
+			__func__, alarm->time.tm_sec, alarm->time.tm_min,
+			alarm->time.tm_hour, alarm->time.tm_mday,
+			alarm->enabled, alarm->pending);
+
+	/* Read alarm 1, control and status registers */
+	ret = ds3231_read_a1_cs(device, &a1_buf[1], &cs_buf[1]);
+	if (ret)
+		return ret;
+
+	/* Disable alarm to make sure no interrupts happen while setting a new
+	 * alarm */
+	cs_buf[0] = DS3231_CTL_REG;
+	cs_buf[1] &= ~DS3231_CTL_A1IE_MASK;
+	cs_buf[2] &= ~DS3231_STATUS_A1F_MASK;
+	ret = ds3231_write_regs(client, cs_buf, sizeof(cs_buf));
+	if (ret) {
+		dev_err(device, "%s: Failed to disable alarm [%d]", __func__,
+			ret);
+		return ret;
+	}
+
+	/* Set the requested alarm */
+	a1_buf[0] = DS3231_A1_BASE_REG;
+	a1_buf[1] |= bin2bcd(alarm->time.tm_sec) & DS3231_A1_SEC_MASK;
+	a1_buf[2] |= bin2bcd(alarm->time.tm_sec) & DS3231_A1_MIN_MASK;
+	a1_buf[3] |= bin2bcd(alarm->time.tm_sec) & DS3231_A1_HOUR_MASK;
+	a1_buf[4] |= bin2bcd(alarm->time.tm_sec) & DS3231_A1_DATE_MASK;
+	ret = ds3231_write_regs(client, a1_buf, sizeof(a1_buf));
+	if (ret) {
+		dev_err(device, "%s: Failed to set the new alarm [%d]",
+				__func__, ret);
+		return ret;
+	}
+
+	/* When requested, enable the alarm - we only work with alarm 1 */
+	if (alarm->enabled) {
+		cs_buf[1] |= DS3231_CTL_A1IE_MASK;
+		ret = ds3231_write_regs(client, cs_buf, sizeof(cs_buf));
+		if (ret)
+			dev_warn(device, "%s: Failed to enable alarm [%d]",
+					__func__, ret);
+	}
+
+	return 0;
+}
+
+static int ds3231_alarm_irq_enable(struct device *dev, unsigned int enabled) {
+	return 0;
+}
+
 /**
  * ds3231_rtc_ops: RTC operations for DS3231
  */
 static const struct rtc_class_ops ds3231_rtc_ops = {
 	.read_time = ds3231_rtc_read_time,
 	.set_time = ds3231_rtc_set_time,
+	.read_alarm = ds3231_rtc_read_alarm,
+	.set_alarm = ds3231_rtc_set_alarm,
+	.alarm_irq_enable = ds3231_alarm_irq_enable,
 };
 
 /**
